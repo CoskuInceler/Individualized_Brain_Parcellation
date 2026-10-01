@@ -1,94 +1,89 @@
-import os
 from pathlib import Path
+import os
 
-# =============================================================================
-# 1. PROJECT ROOT
-# =============================================================================
-# This finds the parent of the "Scripts" folder (i.e., "Analysis")
-# Result: C:\THESIS_MAIN\Analysis
+# Project root: the folder above the Scripts folder holding this file
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-# =============================================================================
-# 2. INPUT PATHS (READ-ONLY)
-# =============================================================================
 INPUTS_DIR = BASE_DIR / "Inputs"
-RAW_DATA_DIR = INPUTS_DIR / "Raw_Data"
-ATLAS_DIR = INPUTS_DIR / "Atlases" / "Schaefer2018"
-GROUP_PRIORS_DIR = INPUTS_DIR / "Group_Priors"
-
-# The specific Atlas File
-SCHAEFER_200_FILE = ATLAS_DIR / "Schaefer2018_200Parcels_17Networks_order.dlabel.nii"
-
+SCRIPTS_DIR = BASE_DIR / "Scripts"
+VARIANT = os.environ.get("IP_VARIANT", "none")
+OUTPUTS_ROOT = BASE_DIR / "Outputs"
+OUTPUTS_DIR = OUTPUTS_ROOT / VARIANT
+LOGS_DIR = BASE_DIR / "Logs"
+# --- Input files ---
+ATLAS_DIR = INPUTS_DIR / "Atlases"
+SCHAEFER_200_FILE = (
+    ATLAS_DIR / "Schaefer2018_200Parcels_17Networks_order.dlabel.nii"
+)
 MESH_DIR = INPUTS_DIR / "Standard_Mesh"
 MESH_FILE_L = MESH_DIR / "L.inflated.32k_fs_LR.surf.gii"
 MESH_FILE_R = MESH_DIR / "R.inflated.32k_fs_LR.surf.gii"
-
-# =============================================================================
-# 3. OUTPUT PATHS (WRITE)
-# =============================================================================
-OUTPUTS_DIR = BASE_DIR / "Outputs"
-
-# Method 0: Schaefer Group Atlas
-METHOD_0_DIR = OUTPUTS_DIR / "Method_0_Schaefer"
-
-# Method 1: MS-HBM Parcellation
-METHOD_1_DIR = OUTPUTS_DIR / "Method_1_MSHBM"
-
-# Method 2: Atlas-Guided Parcellation
-METHOD_2_DIR = OUTPUTS_DIR / "Method_2_AGP"
-
-# Method 3: SLIC with Full spatial+functional constraint
-METHOD_3_DIR = OUTPUTS_DIR / "Method_3_SLIC_F"
-
-# Method 4: SLIC with Cut spatial constraint (functional only)
-METHOD_4_DIR = OUTPUTS_DIR / "Method_4_SLIC_C"
-
-# Shared cleaned data (used by all methods)
-SHARED_DATA_DIR = OUTPUTS_DIR / "Shared_Cleaned"
-
-# Create all output directories if they don't exist
-os.makedirs(METHOD_0_DIR, exist_ok=True)
-os.makedirs(METHOD_1_DIR, exist_ok=True)
-os.makedirs(METHOD_2_DIR, exist_ok=True)
-os.makedirs(METHOD_3_DIR, exist_ok=True)
-os.makedirs(METHOD_4_DIR, exist_ok=True)
-os.makedirs(SHARED_DATA_DIR, exist_ok=True)
-
-# =============================================================================
-# 4. EXPERIMENT CONSTANTS
-# =============================================================================
-SUBJECT_IDS = ["100307", "100408", "100610"]
-
-# We list all 4 runs found in your tree.
-# We can comment out REST2 later if you only want to process REST1.
+GMSHBM_FILE = INPUTS_DIR / "HCP_1029sub_200Parcels_Kong2022_gMSHBM.mat"
+SUBJECT_FILE = INPUTS_DIR / "HCP_subject_list.txt"
+SUBJECT_FILE_FINAL = INPUTS_DIR / "subjects_final.txt"
+# --- Participant list ---
+SUBJECT_IDS = [
+    s.strip()
+    for s in SUBJECT_FILE_FINAL.read_text().splitlines()
+    if s.strip() and not s.strip().startswith("#")
+]
 RUN_IDS = [
     "rfMRI_REST1_LR",
     "rfMRI_REST1_RL",
     "rfMRI_REST2_LR",
-    "rfMRI_REST2_RL"
+    "rfMRI_REST2_RL",
 ]
+# --- HCP raw data (read-only, on the project share) ---
+# Set IP_HCP_ROOT to point at your own copy of the HCP data.
+HCP_ROOT = Path(os.environ.get("IP_HCP_ROOT", "/fs/s6k/project/hcpya25"))
+HCP_REST = HCP_ROOT / "restingstate"
 
-# =============================================================================
-# 5. PATH FINDER FUNCTIONS (The Bridge)
-# =============================================================================
+
 def get_brain_path(subject_id, run_id):
-    """
-    Returns the Path object for the .dtseries.nii file.
-    Logic: Raw_Data / Subject / Direction / Filename
-    """
-    # Extract "LR" or "RL" from "rfMRI_REST1_LR"
-    direction = run_id.split("_")[-1] 
-    
-    filename = f"{run_id}_Atlas_MSMAll_hp2000_clean.dtseries.nii"
-    return RAW_DATA_DIR / subject_id / direction / filename
+    """Path to the cleaned dtseries file of one run."""
+    return (
+        HCP_REST
+        / subject_id
+        / "MNINonLinear"
+        / "Results"
+        / run_id
+        / f"{run_id}_Atlas_MSMAll_hp2000_clean_rclean_tclean.dtseries.nii"
+    )
 
-def get_confound_path(subject_id, run_id, confound_name="Movement_Regressors.txt"):
-    """
-    Returns the Path object for a specific confound text file.
-    Logic: Raw_Data / Regressors / Subject / Run_Name / File
-    """
-    return RAW_DATA_DIR / "Regressors" / subject_id / run_id / confound_name
 
-# =============================================================================
-# END OF CONFIG
-# =============================================================================
+def get_confound_path(subject_id, run_id):
+    """Path to the movement regressor file of one run."""
+    return (
+        HCP_REST
+        / subject_id
+        / "MNINonLinear"
+        / "Results"
+        / run_id
+        / "Movement_Regressors.txt"
+    )
+
+
+# --- Subject-specific surfaces (MSMAll aligned, same space as the fMRI) ---
+HCP_STRUCT = HCP_ROOT / "structural"
+
+
+def get_surface_path(subject_id, hemi, kind="midthickness"):
+    """
+    Path to one subject's cortical surface.
+
+
+
+    hemi : "L" or "R"
+    kind : "midthickness", "inflated", "white", "pial", "sphere"
+
+
+
+    Gradient and geodesic smoothing follow the cortical sheet, so the
+    midthickness surface is the one that matters for those steps.
+    """
+    return (
+        HCP_STRUCT
+        / subject_id
+        / "MNINonLinear"
+        / "fsaverage_LR32k"
+        / f"{subject_id}.{hemi}.{kind}_MSMAll.32k_fs_LR.surf.gii"
+    )

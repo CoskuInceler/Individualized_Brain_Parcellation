@@ -1,0 +1,8 @@
+# Python packages used by the analysis scripts (Python 3.9)
+numpy
+scipy
+pandas
+nibabel
+nilearn
+matplotlib
+h5py

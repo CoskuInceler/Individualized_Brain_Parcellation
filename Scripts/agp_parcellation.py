@@ -1,153 +1,198 @@
 """
-AGP PARCELLATION EXPORT (Method 2)
-====================================
-Exports AGP region growing results to all standard formats.
-
-Takes the raw label arrays from agp_step3_region_growing.py, inflates
-them to the full 32k mesh, and saves in every format.
-
-Output per subject:
-    - {subj}_AGP_Labels_L.npy / R.npy             (raw compressed labels)
-    - {subj}_AGP_Parcellation.dscalar.nii          (CIFTI scalar)
-    - {subj}_AGP_Parcellation.dlabel.nii           (CIFTI label)
-    - {subj}_AGP_Timeseries.csv                    (parcel-averaged timeseries)
-
-All outputs go to: Outputs/Method_2_AGP/
+AGP PARCELLATION (Level 2 — atlas-guided region growing)
+========================================================
+Individualised parcellation that starts from the Schaefer atlas but lets
+each parcel grow according to the subject's own functional data.
+Each parcel begins at its seed vertex. At every step the unassigned vertex
+with the highest mean correlation to the members of an adjacent parcel is
+claimed by that parcel. Growth stops once as many vertices are assigned as
+the atlas itself covers.
+Reimplementation of Li et al. (2022), Computers in Biology and Medicine,
+150, 106078.
+Two engines compute the same quantity:
+    fast    running sum per parcel, one dot product per candidate
+    direct  full member-by-candidate correlation matrix, as in the original
+They are algebraically identical; --engine direct exists to verify that.
+Output per subject and session:
+    Labels/{subject}_{session}_labels.npy   valid-vertex space
+    {subject}_{session}_AGP.npy             parcel time series
 """
 
-import os
+import argparse
+import time
 import numpy as np
-import nibabel as nib
-import pandas as pd
+from scipy.sparse import load_npz
 import config
-from utils import get_valid_vertices, save_cifti
+import utils
 
-N_MESH = 32492
+METHOD = "AGP"
+SESSIONS = ["REST1", "REST2", "ALL"]
 
 
-# =============================================================================
-# CIFTI SAVING
-# =============================================================================
+def zscore_columns(ts):
+    """Z-score each vertex time series, so a dot product gives correlation."""
+    out = ts - ts.mean(axis=0)
+    sd = out.std(axis=0)
+    sd[sd < np.finfo(np.float32).eps] = 1.0
+    return out / sd
 
-def save_dlabel(data_matrix, template_path, output_path):
-    """Save parcellation labels as .dlabel.nii using Schaefer template header."""
-    print(f"   Saving dlabel: {os.path.basename(str(output_path))}")
-    template_img = nib.load(template_path)
-    new_img = nib.Cifti2Image(
-        data_matrix,
-        template_img.header,
-        template_img.nifti_header
+
+def neighbour_lists(adj):
+    """Convert a sparse adjacency matrix into per-vertex index arrays."""
+    adj = adj.tocsr()
+    return [
+        adj.indices[adj.indptr[i] : adj.indptr[i + 1]]
+        for i in range(adj.shape[0])
+    ]
+
+
+def grow_regions(ts, seeds, neighbours, target, engine="fast"):
+    """
+    Grow parcels from their seeds until `target` vertices are assigned.
+
+    Parameters
+    ----------
+    ts         : (T, V) time series for one hemisphere
+    seeds      : (n_parcels, 2) array of parcel id and seed vertex
+    neighbours : list of neighbour index arrays, one per vertex
+    target     : number of vertices to assign in total
+    engine     : "fast" or "direct"
+
+    Returns
+    -------
+    (V,) int array of parcel labels, 0 where unassigned
+    """
+    import heapq
+
+    z = zscore_columns(ts)
+    n_time, n_vert = z.shape
+    labels = np.zeros(n_vert, dtype=np.int32)
+    members = {}
+    running_sum = {}
+    for pid, seed in seeds:
+        pid, seed = int(pid), int(seed)
+        labels[seed] = pid
+        members[pid] = [seed]
+        running_sum[pid] = z[:, seed].copy()
+    assigned = len(members)
+
+    def best_candidate(pid):
+        """Highest-scoring unassigned neighbour of parcel `pid`."""
+        cands = set()
+        for m in members[pid]:
+            for nb in neighbours[m]:
+                if labels[nb] == 0:
+                    cands.add(nb)
+        if not cands:
+            return None
+        cands = np.fromiter(cands, dtype=np.int64, count=len(cands))
+        if engine == "fast":
+            scores = (running_sum[pid] @ z[:, cands]) / (
+                n_time * len(members[pid])
+            )
+        else:
+            pairwise = z[:, members[pid]].T @ z[:, cands] / n_time
+            scores = pairwise.mean(axis=0)
+        k = int(np.argmax(scores))
+        return (-float(scores[k]), int(cands[k]), pid)
+
+    heap = []
+    for pid in members:
+        c = best_candidate(pid)
+        if c:
+            heapq.heappush(heap, c)
+    while heap and assigned < target:
+        neg, vert, pid = heapq.heappop(heap)
+        if labels[vert] != 0:
+            c = best_candidate(pid)
+            if c:
+                heapq.heappush(heap, c)
+            continue
+        labels[vert] = pid
+        members[pid].append(vert)
+        running_sum[pid] += z[:, vert]
+        assigned += 1
+        c = best_candidate(pid)
+        if c:
+            heapq.heappush(heap, c)
+    if assigned < target:
+        print(
+            f"    note: assigned {assigned} of {target}, some parcels ran out of neighbours"
+        )
+    return labels
+
+
+def load_session(subject_id, session):
+    """Cleaned time series for one session; ALL concatenates both."""
+    cleaned = config.OUTPUTS_DIR / "Cleaned"
+    if session == "ALL":
+        return np.concatenate(
+            [
+                np.load(cleaned / f"{subject_id}_REST1.npy"),
+                np.load(cleaned / f"{subject_id}_REST2.npy"),
+            ],
+            axis=0,
+        )
+    return np.load(cleaned / f"{subject_id}_{session}.npy")
+
+
+def process_subject(subject_id, sessions, engine):
+    out_dir = config.OUTPUTS_DIR / f"Method_2_{METHOD}"
+    lab_dir = out_dir / "Labels"
+    lab_dir.mkdir(parents=True, exist_ok=True)
+    ref = config.get_brain_path(subject_id, config.RUN_IDS[0])
+    valid_L = utils.get_valid_vertices(ref, "CIFTI_STRUCTURE_CORTEX_LEFT")
+    valid_R = utils.get_valid_vertices(ref, "CIFTI_STRUCTURE_CORTEX_RIGHT")
+    n_L, n_R = len(valid_L), len(valid_R)
+    atlas_L, atlas_R = utils.load_and_filter_atlas(
+        config.SCHAEFER_200_FILE, valid_L, valid_R
     )
-    nib.save(new_img, output_path)
+    seeds_L = np.load(config.INPUTS_DIR / "seeds_L.npy")
+    seeds_R = np.load(config.INPUTS_DIR / "seeds_R.npy")
+    nbr_L = neighbour_lists(load_npz(config.INPUTS_DIR / "adjacency_L.npz"))
+    nbr_R = neighbour_lists(load_npz(config.INPUTS_DIR / "adjacency_R.npz"))
+    for session in sessions:
+        t0 = time.time()
+        ts = load_session(subject_id, session)
+        lab_L = grow_regions(
+            ts[:, :n_L], seeds_L, nbr_L, int((atlas_L > 0).sum()), engine
+        )
+        lab_R = grow_regions(
+            ts[:, n_L : n_L + n_R],
+            seeds_R,
+            nbr_R,
+            int((atlas_R > 0).sum()),
+            engine,
+        )
+
+        labels = np.concatenate([lab_L, lab_R])
+        np.save(lab_dir / f"{subject_id}_{session}_labels.npy", labels)
+        pids = np.unique(labels[labels > 0])
+        parcels = np.zeros((ts.shape[0], len(pids)), dtype=np.float32)
+        for i, pid in enumerate(pids):
+            parcels[:, i] = ts[:, : len(labels)][:, labels == pid].mean(axis=1)
+        np.save(out_dir / f"{subject_id}_{session}_{METHOD}.npy", parcels)
+        print(
+            f"  {session}: {len(pids)} parcels, "
+            f"{(labels > 0).sum()} vertices ({time.time()-t0:.1f}s)"
+        )
 
 
-# =============================================================================
-# TIMESERIES EXTRACTION
-# =============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="AGP parcellation.")
+    parser.add_argument("--subject", required=True)
+    parser.add_argument(
+        "--sessions", nargs="+", default=SESSIONS, choices=SESSIONS
+    )
+    parser.add_argument("--engine", default="fast", choices=["fast", "direct"])
+    args = parser.parse_args()
+    print(
+        f"Variant {config.VARIANT} | Subject {args.subject} | engine {args.engine}"
+    )
+    t0 = time.time()
+    process_subject(args.subject, args.sessions, args.engine)
+    print(f"Done in {time.time()-t0:.1f}s")
 
-def extract_parcel_timeseries(subj_id, raw_L, raw_R, valid_L, valid_R):
-    """Average dense timeseries within each AGP parcel."""
-    ts_path = config.SHARED_DATA_DIR / "Aggregated" / f"{subj_id}_ALL_Dense.npy"
-
-    if not ts_path.exists():
-        print(f"   [Skip] Dense timeseries not found: {ts_path.name}")
-        return None
-
-    full_ts = np.load(ts_path)
-    print(f"   Dense timeseries: {full_ts.shape}")
-
-    # AGP labels are in valid-vertex space (compressed ~29k)
-    # Dense data columns: [LH valid | RH valid | subcortex]
-    n_L = len(valid_L)
-    n_R = len(valid_R)
-    data_L = full_ts[:, :n_L]
-    data_R = full_ts[:, n_L:n_L + n_R]
-
-    unique_labels = np.unique(np.concatenate([raw_L, raw_R]))
-    unique_labels = unique_labels[unique_labels > 0]
-
-    n_time = full_ts.shape[0]
-    ts_matrix = np.zeros((n_time, len(unique_labels)))
-
-    for i, label in enumerate(unique_labels):
-        mask_L = (raw_L == label)
-        mask_R = (raw_R == label)
-
-        vals_L = data_L[:, mask_L] if np.any(mask_L) else np.empty((n_time, 0))
-        vals_R = data_R[:, mask_R] if np.any(mask_R) else np.empty((n_time, 0))
-
-        all_vals = np.hstack([vals_L, vals_R])
-        ts_matrix[:, i] = np.mean(all_vals, axis=1)
-
-    col_names = [f"Parcel_{int(l)}" for l in unique_labels]
-    return pd.DataFrame(ts_matrix, columns=col_names)
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
 
 if __name__ == "__main__":
-    out_dir = config.METHOD_2_DIR
-    os.makedirs(out_dir, exist_ok=True)
-
-    print("=" * 60)
-    print("AGP PARCELLATION EXPORT (Method 2)")
-    print("=" * 60)
-
-    # Get valid vertex masks
-    ref_path = config.get_brain_path(config.SUBJECT_IDS[0], config.RUN_IDS[0])
-    valid_L = get_valid_vertices(ref_path, 'CIFTI_STRUCTURE_CORTEX_LEFT')
-    valid_R = get_valid_vertices(ref_path, 'CIFTI_STRUCTURE_CORTEX_RIGHT')
-
-    template_path = config.SCHAEFER_200_FILE
-
-    for subj in config.SUBJECT_IDS:
-        print(f"\n{'─' * 40}")
-        print(f"Subject: {subj}")
-        print(f"{'─' * 40}")
-
-        label_L_path = out_dir / f"{subj}_Labels_L.npy"
-        label_R_path = out_dir / f"{subj}_Labels_R.npy"
-
-        if not (label_L_path.exists() and label_R_path.exists()):
-            print(f"   [Skip] Label files missing — run agp_step3 first")
-            continue
-
-        # 1. Load raw labels (compressed valid-vertex space)
-        print("\n[1/4] Loading labels...")
-        raw_L = np.load(label_L_path)
-        raw_R = np.load(label_R_path)
-        print(f"   LH: {raw_L.shape}, RH: {raw_R.shape}")
-
-        # 2. Inflate to full 32k mesh
-        print("\n[2/4] Saving CIFTI files...")
-        full_L = np.zeros(N_MESH, dtype=np.float32)
-        full_R = np.zeros(N_MESH, dtype=np.float32)
-        full_L[valid_L] = raw_L
-        full_R[valid_R] = raw_R
-
-        combined = np.concatenate([full_L, full_R]).reshape(1, -1)
-
-        save_cifti(combined, template_path,
-                   out_dir / f"{subj}_AGP_Parcellation.dscalar.nii")
-        save_dlabel(combined, template_path,
-                    out_dir / f"{subj}_AGP_Parcellation.dlabel.nii")
-
-        # 3. Save full-mesh .npy (for visualization scripts)
-        print("\n[3/4] Saving full-mesh .npy...")
-        np.save(out_dir / f"{subj}_AGP_LH.npy", full_L)
-        np.save(out_dir / f"{subj}_AGP_RH.npy", full_R)
-        print(f"   Saved: {subj}_AGP_LH.npy, {subj}_AGP_RH.npy")
-
-        # 4. Extract timeseries
-        print("\n[4/4] Extracting timeseries...")
-        df = extract_parcel_timeseries(subj, raw_L, raw_R, valid_L, valid_R)
-        if df is not None:
-            csv_path = out_dir / f"{subj}_AGP_Timeseries.csv"
-            df.to_csv(csv_path, index=False)
-            print(f"   Saved: {csv_path.name}  ({df.shape})")
-
-        print(f"\n   ✓ Subject {subj} complete")
-
-    print("\n--- AGP PARCELLATION EXPORT COMPLETE ---")
+    main()

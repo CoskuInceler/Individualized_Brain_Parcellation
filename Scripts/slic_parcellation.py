@@ -1,183 +1,268 @@
 """
-SLIC PARCELLATION EXPORT (Methods 3 & 4)
-==========================================
-Exports SLIC parcellation results to all standard formats.
+SLIC PARCELLATION (Levels 3 and 4)
+==================================
+Surface-based Simple Linear Iterative Clustering, following
 
-Takes the raw label arrays from slic_main.py, shifts labels for unique
-IDs across the brain, inflates to full 32k mesh, and saves everything.
 
-SLIC labels are 0-99 per hemisphere. For export:
-    - Left:  1-100
-    - Right: 101-200
-    - Medial wall: 0
 
-Output per subject per method (SLIC_F and SLIC_C):
-    - {subj}_{method}_LH.npy / RH.npy             (full 32k labels)
-    - {subj}_{method}_Parcellation.dscalar.nii     (CIFTI scalar)
-    - {subj}_{method}_Parcellation.dlabel.nii      (CIFTI label)
-    - {subj}_{method}_Timeseries.csv               (parcel-averaged timeseries)
+    Wang, Hu & Wang (2016). Parcellating Whole Brain for Individuals by
+    Simple Linear Iterative Clustering. ICONIP 2016, LNCS 9949, 131-139.
 
-Outputs go to: Outputs/Method_3_SLIC_F/ and Outputs/Method_4_SLIC_C/
+
+
+Two variants sit at different points of the individualisation gradient:
+
+
+
+    SLIC-F  functional and spatial distance combined; the spatial term
+            keeps parcels compact, so some group-level structure survives
+    SLIC-C  functional distance only; nothing constrains parcels to be
+            spatially contiguous
+
+
+
+The combined distance for vertex i and cluster centre k is
+
+
+
+    d = sqrt( d_func^2 / m^2 + d_spatial^2 / S^2 )
+
+
+
+where S = sqrt(area / K) is the expected parcel spacing in millimetres and
+m plays the same role for the functional term. Functional distance is
+Euclidean distance between z-scored time series divided by sqrt(T), which
+equals sqrt(2 (1 - r)) and so does not change with the number of
+timepoints. m is calibrated per preprocessing variant by
+slic_calibrate_m.py.
+
+
+
+Outputs per subject and session:
+    Method_3_SLIC_F/Labels/{subject}_{session}_labels.npy
+    Method_4_SLIC_C/Labels/{subject}_{session}_labels.npy
+    plus the corresponding parcel time series
 """
 
-import os
+import argparse
+import time
 import numpy as np
-import nibabel as nib
-import pandas as pd
+
+
 import config
-from utils import get_valid_vertices, save_cifti
+import utils
 
-N_MESH = 32492
+N_CLUSTERS = 100  # per hemisphere, 200 in total
+MAX_ITER = 20
+SEED = 42
+SESSIONS = ["REST1", "REST2", "ALL"]
 
 
-# =============================================================================
-# LABEL SHIFTING
-# =============================================================================
+def zscore_rows(ts):
+    """Z-score each vertex, with vertices along the first axis."""
+    ts = np.asarray(ts, dtype=np.float64)
+    out = ts - ts.mean(axis=1, keepdims=True)
+    sd = out.std(axis=1, keepdims=True)
+    sd[sd < np.finfo(np.float32).eps] = 1.0
+    return out / sd
 
-def shift_labels_for_cifti(raw_L, raw_R):
+
+def load_m():
+    """Compactness parameter for the current preprocessing variant."""
+    path = config.INPUTS_DIR / f"slic_m_{config.VARIANT}.txt"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path.name} missing; run slic_calibrate_m.py for this variant first"
+        )
+    return float(path.read_text().strip())
+
+
+def load_areas():
+    """Cortical surface area per hemisphere, in mm^2."""
+    path = config.INPUTS_DIR / "surface_area.txt"
+    areas = {}
+    for line in path.read_text().split("\n"):
+        if line.strip():
+            hemi, val = line.split()
+            areas[hemi] = float(val)
+    return areas
+
+
+def slic(ts, m, geo=None, area=None, engine="fast"):
     """
-    Shift SLIC labels to create unique IDs across the brain.
-    Left: 0â†’1 ... 99â†’100, Right: 0â†’101 ... 99â†’200
+    Cluster the vertices of one hemisphere.
+
+
+
+    Parameters
+    ----------
+    ts     : (V, T) time series, vertices along the first axis
+    m      : compactness parameter
+    geo    : (V, V) geodesic distances; omit for the functional-only variant
+    area   : cortical area in mm^2, required alongside geo
+    engine : "fast" expands the squared distance into a single matrix
+             product; "direct" forms the difference cluster by cluster, as
+             in the reference implementation. The two are algebraically the
+             same and exist so the fast path can be checked.
+
+
+
+    Returns
+    -------
+    (V,) labels in 0 .. K-1
     """
-    shifted_L = raw_L + 1
-    shifted_R = raw_R + 101
-    return shifted_L, shifted_R
+    # distances are accumulated in float64: in float32 the expansion
+    # T - 2 v.c + ||c||^2 loses enough precision to flip occasional
+    # assignments, which then compound over iterations
+    z = zscore_rows(ts).astype(np.float64)
+    n_vert, n_time = z.shape
+
+    spatial = geo is not None
+    if spatial:
+        S = np.sqrt(area / N_CLUSTERS)
+
+    rng = np.random.default_rng(SEED)
+    centre_idx = rng.choice(n_vert, N_CLUSTERS, replace=False)
+    centre_ts = z[centre_idx].copy()
+
+    labels = np.full(n_vert, -1, dtype=np.int32)
+
+    for it in range(MAX_ITER):
+        if engine == "fast":
+            # ||v - c||^2 = ||v||^2 - 2 v.c + ||c||^2, and ||v||^2 = T
+            cross = z @ centre_ts.T
+            d_func_sq = (
+                n_time - 2.0 * cross + (centre_ts**2).sum(axis=1)[None, :]
+            )
+            np.maximum(d_func_sq, 0.0, out=d_func_sq)
+        else:
+            d_func_sq = np.empty((n_vert, N_CLUSTERS), dtype=np.float64)
+            for k in range(N_CLUSTERS):
+                diff = z - centre_ts[k]
+                d_func_sq[:, k] = (diff**2).sum(axis=1)
+
+        # scale so the value depends on correlation, not on T
+        d_func_sq = d_func_sq / n_time
+
+        if spatial:
+            d_spatial = geo[:, centre_idx]
+            total = d_func_sq / (m**2) + (d_spatial**2) / (S**2)
+        else:
+            total = d_func_sq / (m**2)
+
+        new_labels = np.argmin(total, axis=1).astype(np.int32)
+
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+
+        for k in range(N_CLUSTERS):
+            members = np.flatnonzero(labels == k)
+            if members.size == 0:
+                continue
+            centre_ts[k] = z[members].mean(axis=0)
+            if spatial:
+                sub = geo[np.ix_(members, members)]
+                centre_idx[k] = members[np.argmin(sub.sum(axis=1))]
+
+    return labels
 
 
-# =============================================================================
-# CIFTI SAVING
-# =============================================================================
+def load_session(subject_id, session):
+    """Cleaned time series for one session; ALL concatenates both."""
+    cleaned = config.OUTPUTS_DIR / "Cleaned"
+    if session == "ALL":
+        return np.concatenate(
+            [
+                np.load(cleaned / f"{subject_id}_REST1.npy"),
+                np.load(cleaned / f"{subject_id}_REST2.npy"),
+            ],
+            axis=0,
+        )
+    return np.load(cleaned / f"{subject_id}_{session}.npy")
 
-def save_dlabel(data_matrix, template_path, output_path):
-    """Save parcellation labels as .dlabel.nii using Schaefer template header."""
-    print(f"   Saving dlabel: {os.path.basename(str(output_path))}")
-    template_img = nib.load(template_path)
-    new_img = nib.Cifti2Image(
-        data_matrix,
-        template_img.header,
-        template_img.nifti_header
+
+def save_result(out_dir, subject_id, session, labels, ts, n_cortex):
+    """Write labels and the matching parcel time series."""
+    lab_dir = out_dir / "Labels"
+    lab_dir.mkdir(parents=True, exist_ok=True)
+    np.save(lab_dir / f"{subject_id}_{session}_labels.npy", labels)
+
+    pids = np.unique(labels[labels > 0])
+    parcels = np.zeros((ts.shape[0], len(pids)), dtype=np.float32)
+    for i, pid in enumerate(pids):
+        parcels[:, i] = ts[:, :n_cortex][:, labels == pid].mean(axis=1)
+    np.save(
+        out_dir
+        / f"{subject_id}_{session}_{out_dir.name.split('_', 2)[-1]}.npy",
+        parcels,
     )
-    nib.save(new_img, output_path)
 
 
-# =============================================================================
-# TIMESERIES EXTRACTION
-# =============================================================================
+def process_subject(subject_id, sessions, engine):
+    ref = config.get_brain_path(subject_id, config.RUN_IDS[0])
+    n_L = len(utils.get_valid_vertices(ref, "CIFTI_STRUCTURE_CORTEX_LEFT"))
+    n_R = len(utils.get_valid_vertices(ref, "CIFTI_STRUCTURE_CORTEX_RIGHT"))
+    n_cortex = n_L + n_R
 
-def extract_parcel_timeseries(subj_id, raw_L, raw_R, valid_L, valid_R):
-    """
-    Average dense timeseries within each SLIC parcel.
-    L parcels (0-99) and R parcels (0-99) handled separately â†’ 200 columns.
-    """
-    ts_path = config.SHARED_DATA_DIR / "Aggregated" / f"{subj_id}_ALL_Dense.npy"
+    m = load_m()
+    areas = load_areas()
+    print(f"  m = {m:.4f}")
 
-    if not ts_path.exists():
-        print(f"   [Skip] Dense timeseries not found: {ts_path.name}")
-        return None
+    geo = {
+        h: np.load(config.INPUTS_DIR / f"geodesic_{h}.npy", mmap_mode="r")
+        for h in ("L", "R")
+    }
 
-    full_ts = np.load(ts_path)
-    n_time = full_ts.shape[0]
-    n_L = len(valid_L)
-    n_R = len(valid_R)
+    dir_f = config.OUTPUTS_DIR / "Method_3_SLIC_F"
+    dir_c = config.OUTPUTS_DIR / "Method_4_SLIC_C"
 
-    data_L = full_ts[:, :n_L]
-    data_R = full_ts[:, n_L:n_L + n_R]
+    for session in sessions:
+        t0 = time.time()
+        ts = load_session(subject_id, session)
 
-    unique_L = np.unique(raw_L[raw_L >= 0])
-    unique_R = np.unique(raw_R[raw_R >= 0])
+        out = {}
+        for name, use_spatial, target in [
+            ("SLIC_F", True, dir_f),
+            ("SLIC_C", False, dir_c),
+        ]:
+            labels = np.zeros(n_cortex, dtype=np.int32)
 
-    ts_matrix = np.zeros((n_time, len(unique_L) + len(unique_R)))
-    col_names = []
+            for hemi, start, stop in [("L", 0, n_L), ("R", n_L, n_L + n_R)]:
+                block = ts[:, start:stop].T  # (V, T)
+                g = np.asarray(geo[hemi]) if use_spatial else None
+                lab = slic(
+                    block, m, g, areas[hemi] if use_spatial else None, engine
+                )
+                # 1-100 for the left hemisphere, 101-200 for the right
+                offset = 1 if hemi == "L" else N_CLUSTERS + 1
+                labels[start:stop] = lab + offset
 
-    for i, label in enumerate(unique_L):
-        mask = (raw_L == label)
-        if np.any(mask):
-            ts_matrix[:, i] = np.mean(data_L[:, mask], axis=1)
-        col_names.append(f"L_Parcel_{int(label)}")
+            save_result(target, subject_id, session, labels, ts, n_cortex)
+            out[name] = len(np.unique(labels))
 
-    for i, label in enumerate(unique_R):
-        mask = (raw_R == label)
-        if np.any(mask):
-            ts_matrix[:, len(unique_L) + i] = np.mean(data_R[:, mask], axis=1)
-        col_names.append(f"R_Parcel_{int(label)}")
-
-    return pd.DataFrame(ts_matrix, columns=col_names)
+        print(
+            f"  {session}: SLIC-F {out['SLIC_F']} parcels, "
+            f"SLIC-C {out['SLIC_C']} parcels ({time.time()-t0:.1f}s)"
+        )
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="SLIC parcellation.")
+    parser.add_argument("--subject", required=True)
+    parser.add_argument(
+        "--sessions", nargs="+", default=SESSIONS, choices=SESSIONS
+    )
+    parser.add_argument("--engine", default="fast", choices=["fast", "direct"])
+    args = parser.parse_args()
+
+    print(
+        f"Variant {config.VARIANT} | Subject {args.subject} | engine {args.engine}"
+    )
+    t0 = time.time()
+    process_subject(args.subject, args.sessions, args.engine)
+    print(f"Done in {time.time()-t0:.1f}s")
+
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("SLIC PARCELLATION EXPORT (Methods 3 & 4)")
-    print("=" * 60)
-
-    # Get valid vertex masks
-    ref_path = config.get_brain_path(config.SUBJECT_IDS[0], config.RUN_IDS[0])
-    valid_L = get_valid_vertices(ref_path, 'CIFTI_STRUCTURE_CORTEX_LEFT')
-    valid_R = get_valid_vertices(ref_path, 'CIFTI_STRUCTURE_CORTEX_RIGHT')
-
-    template_path = config.SCHAEFER_200_FILE
-
-    methods = [
-        ('SLIC_F', config.METHOD_3_DIR),
-        ('SLIC_C', config.METHOD_4_DIR),
-    ]
-
-    for method_name, method_dir in methods:
-        os.makedirs(method_dir, exist_ok=True)
-
-        print(f"\n{'â•' * 40}")
-        print(f"Method: {method_name}")
-        print(f"{'â•' * 40}")
-
-        for subj in config.SUBJECT_IDS:
-            print(f"\n[Subject] {subj}")
-
-            label_L_path = method_dir / f"{subj}_Labels_L.npy"
-            label_R_path = method_dir / f"{subj}_Labels_R.npy"
-
-            if not (label_L_path.exists() and label_R_path.exists()):
-                print(f"   [Skip] Label files missing â€” run slic_main first")
-                continue
-
-            # 1. Load raw labels (compressed valid-vertex space, 0-99)
-            print("   [1/4] Loading labels...")
-            raw_L = np.load(label_L_path)
-            raw_R = np.load(label_R_path)
-            print(f"   LH: {raw_L.shape}, RH: {raw_R.shape}")
-
-            # 2. Shift + inflate to full 32k mesh
-            print("   [2/4] Saving CIFTI files...")
-            shifted_L, shifted_R = shift_labels_for_cifti(raw_L, raw_R)
-
-            full_L = np.zeros(N_MESH, dtype=np.float32)
-            full_R = np.zeros(N_MESH, dtype=np.float32)
-            full_L[valid_L] = shifted_L
-            full_R[valid_R] = shifted_R
-
-            combined = np.concatenate([full_L, full_R]).reshape(1, -1)
-
-            save_cifti(combined, template_path,
-                       method_dir / f"{subj}_{method_name}_Parcellation.dscalar.nii")
-            save_dlabel(combined, template_path,
-                        method_dir / f"{subj}_{method_name}_Parcellation.dlabel.nii")
-
-            # 3. Save full-mesh .npy (for visualization)
-            print("   [3/4] Saving full-mesh .npy...")
-            np.save(method_dir / f"{subj}_{method_name}_LH.npy", full_L)
-            np.save(method_dir / f"{subj}_{method_name}_RH.npy", full_R)
-            print(f"   Saved: {subj}_{method_name}_LH.npy, {subj}_{method_name}_RH.npy")
-
-            # 4. Extract timeseries
-            print("   [4/4] Extracting timeseries...")
-            df = extract_parcel_timeseries(subj, raw_L, raw_R, valid_L, valid_R)
-            if df is not None:
-                csv_path = method_dir / f"{subj}_{method_name}_Timeseries.csv"
-                df.to_csv(csv_path, index=False)
-                print(f"   Saved: {csv_path.name}  ({df.shape})")
-
-            print(f"   âœ“ {subj} complete")
-
-    print("\n--- SLIC PARCELLATION EXPORT COMPLETE ---")
+    main()
